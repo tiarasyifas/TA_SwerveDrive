@@ -1,3 +1,6 @@
+from glob import glob
+import os
+
 from setuptools import find_packages, setup
 
 package_name = 'robotpadi_controller'
@@ -10,11 +13,12 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name, ['robotpadi_controller/robotpadi_plotjuggler_layout.xml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='tiara',
-    maintainer_email='tiarasyifass@gmail.com',
+    maintainer='ubuntu',
+    maintainer_email='harish.faqot02@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
     extras_require={
@@ -23,7 +27,10 @@ setup(
         ],
     },
     entry_points={
-        'console_scripts': [
-        ],
-    },
+    'console_scripts': [
+        'swerve_nav_goal = robotpadi_controller.swerve_nav_goal:main',
+        'robot_state_monitor = robotpadi_controller.robot_state_monitor:main',
+        # other nodes...
+    ],
+},
 )
