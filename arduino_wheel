@@ -1,0 +1,111 @@
+#define RPWM 2
+#define LPWM 3
+
+#define ENC_A 18     // interrupt-capable pin (2, 3, 18, 19, 20, or 21 on Mega)
+#define ENC_B 26    // any digital pin, no interrupt needed
+
+volatile long encoderPos = 0;
+long targetPos = 0;
+
+// ---- PID tuning ----
+double Kp = 6;
+double Ki = 8;
+double Kd = 0.00;
+
+double integral = 0;
+double lastError = 0;
+double output = 0;
+unsigned long lastPidTime = 0;
+
+const int maxPWM = 255;
+const int tolerance = 2;
+
+void setup() {
+  pinMode(RPWM, OUTPUT);
+  pinMode(LPWM, OUTPUT);
+
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENC_A), updateEncoder, CHANGE);
+
+  Serial.begin(115200);
+  Serial.println("Enter target position:");
+
+  lastPidTime = millis();
+}
+
+void loop() {
+
+  if (Serial.available()) {
+    targetPos = Serial.parseInt();
+    while (Serial.available()) Serial.read();   // flush trailing \n / \r
+
+    integral = 0;
+    lastError = 0;
+
+    Serial.print("New Target = ");
+    Serial.println(targetPos);
+  }
+
+  runPID();
+
+  static unsigned long t = 0;
+  if (millis() - t > 100) {
+    t = millis();
+    Serial.print("Position: ");
+    Serial.print(encoderPos);
+    Serial.print("  Target: ");
+    Serial.print(targetPos);
+    Serial.print("  Speed: ");
+    Serial.println(output);
+  }
+}
+
+void runPID() {
+  unsigned long now = millis();
+  double dt = (now - lastPidTime) / 1000.0;
+  if (dt <= 0) return;
+  lastPidTime = now;
+
+  long error = targetPos - encoderPos;
+
+  if (abs(error) <= tolerance) {
+    stopMotor();
+    integral = 0;
+    lastError = 0;
+    return;
+  }
+
+  integral += error * dt;
+  double derivative = (error - lastError) / dt;
+  lastError = error;
+
+  output = Kp * error + Ki * integral + Kd * derivative;
+
+  if (output > maxPWM) output = maxPWM;
+  if (output < -maxPWM) output = -maxPWM;
+
+  if (output > 0) forward((int)output);
+  else reverse((int)(-output));
+}
+
+void updateEncoder() {
+  if (digitalRead(ENC_A) == digitalRead(ENC_B)) encoderPos--;
+  else encoderPos++;
+}
+
+void forward(int pwm) {
+  analogWrite(RPWM, pwm);
+  analogWrite(LPWM, 0);
+}
+
+void reverse(int pwm) {
+  analogWrite(RPWM, 0);
+  analogWrite(LPWM, pwm);
+}
+
+void stopMotor() {
+  analogWrite(RPWM, 0);
+  analogWrite(LPWM, 0);
+}
