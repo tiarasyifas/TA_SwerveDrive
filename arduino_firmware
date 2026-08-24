@@ -1,0 +1,443 @@
+/*
+ * robotpadi_firmware.ino
+ * -----------------------------------------------------------------------
+ * Combined firmware for the robotpadi swerve-drive base:
+ *   - 4x DC wheel motors  (RPWM/LPWM driver, quadrature encoder feedback,
+ *                           velocity PID -> mirrors /wheel_controller/commands,
+ *                           joints "Revolute 5..8")
+ *   - 4x stepper steering  (STEP/DIR driver e.g. HBS57, AccelStepper position
+ *                           control -> mirrors /steering_controller/commands,
+ *                           joints "Revolute 1..4")
+ *
+ * This board does NOT run micro-ROS (AVR/Mega is not RAM-capable enough for
+ * rclc). Instead it speaks a small text protocol over USB-serial to a ROS 2
+ * node running on the host PC (robotpadi_hardware_bridge.py). That node
+ * subscribes to the exact same topics the Gazebo simulation used
+ * (/wheel_controller/commands, /steering_controller/commands) and publishes
+ * /joint_states from this board's feedback -- so, from ROS's point of view,
+ * this Arduino is a drop-in replacement for the Gazebo plugin.
+ *
+ * Wheel order everywhere (index 0..3) = [Revolute5, Revolute6, Revolute7, Revolute8]
+ * Steering order everywhere (index 0..3) = [Revolute1, Revolute2, Revolute3, Revolute4]
+ * NOTE: confirm this index-to-corner (FL/FR/RL/RR) mapping against your URDF joint
+ * order before trusting sign/direction -- swerve_controller.py's internal comment
+ * and its actual corner-iteration order disagree, so don't assume FL=index0 blindly.
+ *
+ * ---- CHANGELOG vs previous version ----
+ *   [FIX] sendFeedback() now builds one buffer and does a single non-blocking
+ *         Serial.write() (skips the cycle entirely if the TX buffer isn't
+ *         free enough) instead of 13 separate Serial.print() calls. This was
+ *         the biggest source of multi-millisecond stalls in loop(), which is
+ *         what was causing the stepper stutter compared to the standalone
+ *         single-stepper test sketch.
+ *   [FIX] Manual wheel test-mode override (w<n>,<pwm>) now times out after
+ *         CMD_TIMEOUT_MS of no new manual command, same safety window as ROS
+ *         commands, instead of spinning forever until you manually zero it.
+ * -----------------------------------------------------------------------
+ *
+ * ---- Serial protocol (115200 baud, newline terminated ASCII) ----
+ * Host -> Arduino (velocity + steering command, sent whenever the ROS topics update,
+ *                   and re-sent periodically as a "still alive" heartbeat):
+ *   V,w0,w1,w2,w3,s0,s1,s2,s3\n
+ *     w_i = target wheel angular velocity, rad/s   (signed)
+ *     s_i = target steering angle, rad              (signed, 0 = forward)
+ *
+ * Arduino -> Host (feedback, streamed at FEEDBACK_HZ):
+ *   F,p0,p1,p2,p3,v0,v1,v2,v3,a0,a1,a2,a3\n
+ *     p_i = wheel encoder position, rad (cumulative, since boot)
+ *     v_i = measured wheel velocity, rad/s
+ *     a_i = estimated steering angle, rad (from commanded step count -- open loop,
+ *           no steering encoders in this build)
+ *
+ * If no 'V' command is received for CMD_TIMEOUT_MS, all wheels are stopped
+ * (steering holds last position) as a safety fallback. This safety timeout
+ * only applies to wheels that are under ROS/PID control -- see MANUAL TEST
+ * MODE below.
+ *
+ * ---- MANUAL TEST MODE (type these directly into the Arduino Serial Monitor) ----
+ * These are for bench-testing individual motors -- they are NOT part of the
+ * ROS protocol and ROS never sends them.
+ *
+ *   w<n>,<pwm>   e.g. "w1,100"   Drive wheel n (1-4, 1-indexed) open-loop at
+ *                                the given PWM duty cycle (-255..255). This
+ *                                bypasses the velocity PID entirely -- there
+ *                                is no position control for wheels, only
+ *                                velocity, so this is a raw "spin the motor"
+ *                                test, not a move-to-position command.
+ *                                The wheel keeps spinning at that PWM until
+ *                                you send another w<n> command, "w<n>,0",
+ *                                a ROS 'V' command arrives (which hands that
+ *                                wheel back to ROS/PID control), OR
+ *                                CMD_TIMEOUT_MS passes with no new manual
+ *                                command for that wheel (safety cutoff).
+ *   s<n>,<deg>   e.g. "s1,90"    Move steering n (1-4, 1-indexed) to <deg>
+ *                                degrees (position control, same mechanism
+ *                                ROS uses). Safe to mix with ROS at any time
+ *                                -- the next ROS command simply overrides it.
+ *
+ * Sending a normal ROS 'V,...' line always reasserts full ROS/PID control of
+ * all four wheels (clears any manual wheel override).
+ * -----------------------------------------------------------------------
+ */
+
+#include <AccelStepper.h>
+
+// ======================= USER-TUNABLE CONSTANTS =======================
+
+// ---- Wheel (DC motor) geometry / encoder ----
+const double WHEEL_ENCODER_CPR   = 1980.0;  // counts per wheel-shaft revolution (encoder CPR * gear ratio, quadrature-decoded). SET THIS for your motor/encoder/gearbox.
+const double WHEEL_RAD_PER_COUNT = (2.0 * PI) / WHEEL_ENCODER_CPR;
+
+// ---- Steering (stepper) geometry ----
+const float STEER_GEARBOX_RATIO  = 36.0;    // as in original HBS57 code
+const float STEER_STEPS_PER_REV  = 800.0;   // match SW1-SW4 DIP setting on the driver
+const float STEER_STEPS_PER_RAD  = (STEER_STEPS_PER_REV * STEER_GEARBOX_RATIO) / (2.0 * PI);
+const float STEER_MAX_SPEED_SPS  = 20000.0;  // steps/sec
+const float STEER_MAX_ACCEL_SPS2 = 10000.0;  // steps/sec^2
+
+// ---- Wheel velocity PID (per-wheel, same gains for all four -- tune per motor if needed) ----
+double Kp = 6.0;
+double Ki = 8.0;
+double Kd = 0.0;
+const int   MAX_PWM = 255;
+
+// ---- Timing ----
+const unsigned long PID_PERIOD_MS      = 10;   // 100 Hz wheel velocity control loop
+const unsigned long FEEDBACK_PERIOD_MS = 20;   // 50 Hz feedback stream to ROS
+const unsigned long CMD_TIMEOUT_MS     = 500;  // stop wheels if no command received in this long
+
+// ======================= PIN MAP =======================
+// DC wheel motors: RPWM/LPWM driver (e.g. BTS7960), quadrature encoder A/B.
+// A channel MUST be an interrupt pin on Mega2560: 2,3,18,19,20,21.
+struct WheelPins {
+  uint8_t rpwm, lpwm, encA, encB;
+};
+WheelPins wheelPins[4] = {
+  { 2,  3, 18, 26 },   // wheel 0  (Revolute 5)
+  { 4,  5, 19, 27 },   // wheel 1  (Revolute 6)
+  { 6,  7, 20, 28 },   // wheel 2  (Revolute 7)
+  { 8,  9, 21, 29 },   // wheel 3  (Revolute 8)
+};
+
+// Stepper steering: STEP/DIR/ENABLE driver (e.g. HBS57).
+struct SteerPins {
+  uint8_t pul, dir, ena;
+};
+SteerPins steerPins[4] = {
+  { 30, 31, 32 },   // steering 0  (Revolute 1)
+  { 33, 34, 35 },   // steering 1  (Revolute 2)
+  { 36, 37, 38 },   // steering 2  (Revolute 3)
+  { 39, 40, 41 },   // steering 3  (Revolute 4)
+};
+
+// ======================= STATE =======================
+
+// --- Wheels ---
+volatile long encoderCount[4] = {0, 0, 0, 0};
+long lastEncoderCount[4]      = {0, 0, 0, 0};
+
+double targetWheelVel[4] = {0, 0, 0, 0};   // rad/s, from ROS
+double measuredWheelVel[4] = {0, 0, 0, 0}; // rad/s
+double wheelIntegral[4] = {0, 0, 0, 0};
+double wheelLastError[4] = {0, 0, 0, 0};
+double wheelPwmOut[4] = {0, 0, 0, 0};
+
+// --- Manual test-mode override (Serial Monitor "w<n>,<pwm>") ---
+bool wheelManualOverride[4]        = {false, false, false, false};
+int  manualWheelPwm[4]             = {0, 0, 0, 0};
+unsigned long lastManualCmdTime[4] = {0, 0, 0, 0}; // [FIX] per-wheel manual-mode watchdog
+
+// --- Steering ---
+AccelStepper steppers[4] = {
+  AccelStepper(AccelStepper::DRIVER, steerPins[0].pul, steerPins[0].dir),
+  AccelStepper(AccelStepper::DRIVER, steerPins[1].pul, steerPins[1].dir),
+  AccelStepper(AccelStepper::DRIVER, steerPins[2].pul, steerPins[2].dir),
+  AccelStepper(AccelStepper::DRIVER, steerPins[3].pul, steerPins[3].dir),
+};
+double targetSteerAngle[4] = {0, 0, 0, 0}; // rad, from ROS or manual test command
+
+// --- Comms / timing ---
+unsigned long lastPidTime      = 0;
+unsigned long lastFeedbackTime = 0;
+unsigned long lastCmdTime      = 0;
+String rxLine;
+
+// [FIX] scratch buffer for the non-blocking feedback line (built once, sent with one write())
+char feedbackBuf[160];
+
+// ======================= ENCODER ISRs =======================
+// One ISR per wheel; each is a thin wrapper because attachInterrupt needs a
+// distinct function pointer per pin.
+void isrEnc0() { encoderCount[0] += (digitalRead(wheelPins[0].encA) == digitalRead(wheelPins[0].encB)) ? -1 : 1; }
+void isrEnc1() { encoderCount[1] += (digitalRead(wheelPins[1].encA) == digitalRead(wheelPins[1].encB)) ? -1 : 1; }
+void isrEnc2() { encoderCount[2] += (digitalRead(wheelPins[2].encA) == digitalRead(wheelPins[2].encB)) ? -1 : 1; }
+void isrEnc3() { encoderCount[3] += (digitalRead(wheelPins[3].encA) == digitalRead(wheelPins[3].encB)) ? -1 : 1; }
+
+// ======================= SETUP =======================
+
+void setup() {
+  Serial.begin(115200);
+  rxLine.reserve(96);
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(wheelPins[i].rpwm, OUTPUT);
+    pinMode(wheelPins[i].lpwm, OUTPUT);
+    pinMode(wheelPins[i].encA, INPUT_PULLUP);
+    pinMode(wheelPins[i].encB, INPUT_PULLUP);
+    stopWheel(i);
+  }
+  attachInterrupt(digitalPinToInterrupt(wheelPins[0].encA), isrEnc0, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(wheelPins[1].encA), isrEnc1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(wheelPins[2].encA), isrEnc2, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(wheelPins[3].encA), isrEnc3, CHANGE);
+
+  for (int i = 0; i < 4; i++) {
+    pinMode(steerPins[i].ena, OUTPUT);
+    digitalWrite(steerPins[i].ena, HIGH); // adjust HIGH/LOW to match your driver's enable polarity
+    steppers[i].setMaxSpeed(STEER_MAX_SPEED_SPS);
+    steppers[i].setAcceleration(STEER_MAX_ACCEL_SPS2);
+    steppers[i].setCurrentPosition(0); // assumes steering starts centered (0 rad) at boot
+  }
+
+  lastPidTime = lastFeedbackTime = lastCmdTime = millis();
+
+  Serial.println(F("# robotpadi firmware ready."));
+  Serial.println(F("# ROS: send 'V,w0,w1,w2,w3,s0,s1,s2,s3'"));
+  Serial.println(F("# Manual test: 'w<1-4>,<pwm -255..255>'  e.g. w1,100"));
+  Serial.println(F("# Manual test: 's<1-4>,<deg>'            e.g. s1,90"));
+}
+
+// ======================= MAIN LOOP =======================
+
+void loop() {
+  readSerialCommands();
+
+  unsigned long now = millis();
+
+  // Safety: stop wheels if the host stops sending ROS commands. Wheels that
+  // are currently under a manual test-mode override are left alone here --
+  // they have their own watchdog below.
+  if (now - lastCmdTime > CMD_TIMEOUT_MS) {
+    for (int i = 0; i < 4; i++) {
+      if (!wheelManualOverride[i]) targetWheelVel[i] = 0.0;
+    }
+  }
+
+  // [FIX] Manual override watchdog: if you typed w<n>,<pwm> and never
+  // followed up (no w<n>,0 and no ROS 'V' line), auto-stop that wheel after
+  // CMD_TIMEOUT_MS so it doesn't spin forever unattended.
+  for (int i = 0; i < 4; i++) {
+    if (wheelManualOverride[i] && (now - lastManualCmdTime[i] > CMD_TIMEOUT_MS)) {
+      wheelManualOverride[i] = false;
+      targetWheelVel[i] = 0.0;
+      stopWheel(i);
+      Serial.print(F("# WARN wheel ")); Serial.print(i + 1);
+      Serial.println(F(" manual override timed out -> stopped"));
+    }
+  }
+
+  if (now - lastPidTime >= PID_PERIOD_MS) {
+    double dt = (now - lastPidTime) / 1000.0;
+    lastPidTime = now;
+    for (int i = 0; i < 4; i++) runWheelVelocityPID(i, dt);
+  }
+
+  // Steering: AccelStepper needs frequent run() calls to generate step pulses.
+  // Kept as close to loop() top-level as possible -- avoid adding blocking
+  // calls (Serial.print, delay, etc.) between here and the top of loop().
+  for (int i = 0; i < 4; i++) steppers[i].run();
+
+  if (now - lastFeedbackTime >= FEEDBACK_PERIOD_MS) {
+    lastFeedbackTime = now;
+    sendFeedback();
+  }
+}
+
+// ======================= SERIAL PROTOCOL =======================
+
+void readSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      parseCommandLine(rxLine);
+      rxLine = "";
+    } else if (c != '\r') {
+      rxLine += c;
+      if (rxLine.length() > 120) rxLine = ""; // guard against garbage/overflow
+    }
+  }
+}
+
+void parseCommandLine(const String& lineIn) {
+  String line = lineIn;
+  line.trim();
+  if (line.length() < 3) return; // shortest valid line is e.g. "w1,0"
+
+  char cmd = line.charAt(0);
+
+  if (cmd == 'V') {
+    parseRosCommand(line);
+  } else if ((cmd == 'w' || cmd == 'W') && isDigit(line.charAt(1))) {
+    parseManualWheelCommand(line);
+  } else if ((cmd == 's' || cmd == 'S') && isDigit(line.charAt(1))) {
+    parseManualSteerCommand(line);
+  }
+  // anything else (blank lines, stray text, echoed characters, ...) is ignored
+}
+
+// ---- ROS command: "V,w0,w1,w2,w3,s0,s1,s2,s3" (0-indexed, rad/s and rad) ----
+void parseRosCommand(const String& line) {
+  double vals[8];
+  int idx = 0;
+  int start = 2; // skip "V,"
+  for (int i = 2; i <= line.length() && idx < 8; i++) {
+    if (i == line.length() || line.charAt(i) == ',') {
+      if (i > start) vals[idx++] = line.substring(start, i).toDouble();
+      start = i + 1;
+    }
+  }
+  if (idx != 8) return; // malformed line, ignore
+
+  // A real ROS command always takes full control back from manual test mode.
+  for (int i = 0; i < 4; i++) wheelManualOverride[i] = false;
+
+  for (int i = 0; i < 4; i++) targetWheelVel[i] = vals[i];
+  for (int i = 0; i < 4; i++) {
+    targetSteerAngle[i] = vals[4 + i];
+    steppers[i].moveTo((long)(targetSteerAngle[i] * STEER_STEPS_PER_RAD));
+  }
+  lastCmdTime = millis();
+}
+
+// ---- Manual test command: "w<1-4>,<pwm>" (1-indexed, open-loop PWM -255..255) ----
+void parseManualWheelCommand(const String& line) {
+  int commaPos = line.indexOf(',');
+  if (commaPos < 0) { Serial.println(F("# ERR: use w<1-4>,<pwm>  e.g. w1,100")); return; }
+
+  int userIdx = line.substring(1, commaPos).toInt();
+  int i = userIdx - 1; // 1-indexed for humans -> 0-indexed internally
+  if (i < 0 || i > 3) { Serial.println(F("# ERR: wheel index must be 1-4")); return; }
+
+  int pwm = line.substring(commaPos + 1).toInt();
+  pwm = constrain(pwm, -MAX_PWM, MAX_PWM);
+
+  wheelManualOverride[i] = true;
+  manualWheelPwm[i] = pwm;
+  lastManualCmdTime[i] = millis(); // [FIX] refresh the per-wheel watchdog
+  driveWheel(i, pwm);
+
+  Serial.print(F("# OK wheel ")); Serial.print(userIdx);
+  Serial.print(F(" manual PWM = ")); Serial.println(pwm);
+}
+
+// ---- Manual test command: "s<1-4>,<deg>" (1-indexed, position control) ----
+void parseManualSteerCommand(const String& line) {
+  int commaPos = line.indexOf(',');
+  if (commaPos < 0) { Serial.println(F("# ERR: use s<1-4>,<deg>  e.g. s1,90")); return; }
+
+  int userIdx = line.substring(1, commaPos).toInt();
+  int i = userIdx - 1; // 1-indexed for humans -> 0-indexed internally
+  if (i < 0 || i > 3) { Serial.println(F("# ERR: steering index must be 1-4")); return; }
+
+  float deg = line.substring(commaPos + 1).toFloat();
+  targetSteerAngle[i] = deg * DEG_TO_RAD;
+  steppers[i].moveTo((long)(targetSteerAngle[i] * STEER_STEPS_PER_RAD));
+
+  Serial.print(F("# OK steering ")); Serial.print(userIdx);
+  Serial.print(F(" -> ")); Serial.print(deg); Serial.println(F(" deg"));
+}
+
+// [FIX] Build the whole "F,..." line into a buffer and send it with ONE
+// Serial.write() call, and only if the TX buffer has enough free space to
+// take it without blocking. This removes the ~12 separate Serial.print()
+// calls (each doing float-to-string conversion) that were previously the
+// biggest source of loop() stalls -- and those stalls were what made the
+// stepper motion visibly less smooth than in the standalone test sketch.
+// If the buffer isn't free enough on a given cycle, we simply skip that
+// feedback frame and try again next cycle (missing one 20 ms frame is
+// harmless; blocking loop() for >1 ms at 20000 steps/sec is not).
+void sendFeedback() {
+  if (Serial.availableForWrite() < 150) return; // not enough room -> skip this cycle, don't block
+
+  int n = 0;
+  n += snprintf(feedbackBuf + n, sizeof(feedbackBuf) - n, "F");
+
+  for (int i = 0; i < 4; i++) {
+    n += snprintf(feedbackBuf + n, sizeof(feedbackBuf) - n, ",%.4f",
+                  encoderCount[i] * WHEEL_RAD_PER_COUNT);
+  }
+  for (int i = 0; i < 4; i++) {
+    n += snprintf(feedbackBuf + n, sizeof(feedbackBuf) - n, ",%.4f", measuredWheelVel[i]);
+  }
+  for (int i = 0; i < 4; i++) {
+    n += snprintf(feedbackBuf + n, sizeof(feedbackBuf) - n, ",%.4f",
+                  steppers[i].currentPosition() / STEER_STEPS_PER_RAD);
+  }
+  n += snprintf(feedbackBuf + n, sizeof(feedbackBuf) - n, "\n");
+
+  if (n > 0 && n < (int)sizeof(feedbackBuf)) {
+    Serial.write((const uint8_t*)feedbackBuf, n);
+  }
+}
+
+// ======================= WHEEL VELOCITY PID =======================
+
+void runWheelVelocityPID(int i, double dt) {
+  if (dt <= 0) return;
+
+  noInterrupts();
+  long count = encoderCount[i];
+  interrupts();
+
+  long deltaCount = count - lastEncoderCount[i];
+  lastEncoderCount[i] = count;
+
+  measuredWheelVel[i] = (deltaCount * WHEEL_RAD_PER_COUNT) / dt;
+
+  // Manual test-mode wheels are driven open-loop from parseManualWheelCommand()
+  // (PWM is held until changed or the watchdog above times it out) -- skip
+  // the PID entirely, but keep tracking measuredWheelVel above so
+  // /joint_states feedback stays accurate.
+  if (wheelManualOverride[i]) {
+    wheelIntegral[i] = 0;
+    wheelLastError[i] = 0;
+    return;
+  }
+
+  double error = targetWheelVel[i] - measuredWheelVel[i];
+
+  // Stop cleanly (and avoid integral windup) when a near-zero target is requested.
+  if (fabs(targetWheelVel[i]) < 1e-3 && fabs(measuredWheelVel[i]) < 0.05) {
+    stopWheel(i);
+    wheelIntegral[i] = 0;
+    wheelLastError[i] = 0;
+    return;
+  }
+
+  wheelIntegral[i] += error * dt;
+  double derivative = (error - wheelLastError[i]) / dt;
+  wheelLastError[i] = error;
+
+  double out = Kp * error + Ki * wheelIntegral[i] + Kd * derivative;
+  if (out > MAX_PWM) { out = MAX_PWM; wheelIntegral[i] -= error * dt; } // basic anti-windup
+  if (out < -MAX_PWM) { out = -MAX_PWM; wheelIntegral[i] -= error * dt; }
+  wheelPwmOut[i] = out;
+
+  driveWheel(i, (int)out);
+}
+
+void driveWheel(int i, int pwm) {
+  if (pwm >= 0) {
+    analogWrite(wheelPins[i].rpwm, pwm);
+    analogWrite(wheelPins[i].lpwm, 0);
+  } else {
+    analogWrite(wheelPins[i].rpwm, 0);
+    analogWrite(wheelPins[i].lpwm, -pwm);
+  }
+}
+
+void stopWheel(int i) {
+  analogWrite(wheelPins[i].rpwm, 0);
+  analogWrite(wheelPins[i].lpwm, 0);
+  wheelPwmOut[i] = 0;
+}
