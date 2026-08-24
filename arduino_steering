@@ -1,0 +1,51 @@
+#include <AccelStepper.h>
+
+// ---------- Pin Definitions ----------
+#define PUL_PIN 30   // Step / Pulse
+#define DIR_PIN 31   // Direction
+#define ENA_PIN 32    // Enable
+
+// ---------- Motor / Driver Configuration ----------
+const float GEARBOX_RATIO = 36;
+const float STEPS_PER_REV = 800.0;   // <-- match your SW1-SW4 DIP setting
+const float STEPS_PER_DEG = (STEPS_PER_REV * GEARBOX_RATIO) / 360.0;
+
+AccelStepper stepper(AccelStepper::DRIVER, PUL_PIN, DIR_PIN);
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENA_PIN, OUTPUT);
+  digitalWrite(ENA_PIN, HIGH);   // LOW = driver enabled (motor holds/locks)
+                                // NOTE: manual says "when ENA signal is active,
+                                // motor is free/unlocked" -- verify polarity
+                                // with your specific driver; swap HIGH/LOW
+                                // below if behavior is reversed.
+
+  stepper.setMaxSpeed(20000);      // steps/sec - tune to your needs
+  stepper.setAcceleration(5000);  // steps/sec^2
+
+  Serial.println("HBS57 Servo-Style Angle Control");
+  Serial.println("Type an angle (e.g. 90, -45, 180) and press Enter:");
+}
+
+void loop() {
+  // --- Check for new angle command over Serial ---
+  if (Serial.available()) {
+    float angle = Serial.parseFloat();
+    // clear any trailing newline/garbage
+    while (Serial.available()) Serial.read();
+
+    long targetSteps = (long)(angle * STEPS_PER_DEG);
+    stepper.moveTo(targetSteps);
+
+    Serial.print("Moving to angle: ");
+    Serial.print(angle);
+    Serial.print(" deg  (");
+    Serial.print(targetSteps);
+    Serial.println(" steps)");
+  }
+
+  // --- Must be called continuously to generate pulses ---
+  stepper.run();
+}
